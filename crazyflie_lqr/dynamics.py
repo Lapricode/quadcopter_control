@@ -18,7 +18,7 @@ import numpy as np
 from scipy.linalg import expm
 
 from . import state as st
-from .lie import so3
+from .lie import s3, so3
 from .params import CrazyflieParams
 
 
@@ -109,6 +109,72 @@ def step_rk4(x, F, p, dt):
     k3 = dynamics(st.plus(x, 0.5 * dt * k2), F, p)
     k4 = dynamics(st.plus(x, dt * k3), F, p)
     return st.plus(x, dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4))
+
+
+def step_semi_implicit(x, F, p, dt):
+    """Semi-implicit (symplectic) Euler: update the velocities first, then the poses with the *new* velocities.
+
+        omega+ = omega + dt * I^-1 (tau - omega x I omega)
+        v+     = v + dt * ( (R^T [0,0,-m g] + [0,0,T]) / m - omega+ x v )     (old R, new omega)
+        q+     = q (x) Exp(omega+ dt)
+        r+     = r + dt * R+ v+                                               (new R, new v)
+
+    First-order accurate, like explicit Euler (measured order 1.0).  It is NOT more accurate than explicit
+    Euler in general: its error constant is smaller in some closed-loop tests and larger in open-loop
+    tumbling, and it can blow up at very coarse steps (80 ms).  Its advantages here are cost (analytic
+    Jacobians, no matrix exponential) and a clean, exactly differentiable discrete model.  RK4 remains the
+    default wherever accuracy matters (README, section 9).
+    """
+    R = st.rotation(x)
+    v, w = x[st.V_SL], x[st.W_SL]
+    wrench = p.mixer @ F
+    T, tau = wrench[0], wrench[1:]
+    w_new = w + dt * (p.inertia_inv @ (tau - np.cross(w, p.inertia @ w)))
+    f_body = R.T @ np.array([0.0, 0.0, -p.mass * p.g]) + np.array([0.0, 0.0, T])
+    v_new = v + dt * (f_body / p.mass - np.cross(w_new, v))
+    q_new = s3.plus_right(x[st.Q_SL], w_new * dt)
+    r_new = x[st.R_SL] + dt * (s3.to_matrix(q_new) @ v_new)
+    return np.concatenate([r_new, q_new, v_new, w_new])
+
+
+def discretize_semi_implicit(x, F, p, dt):
+    """Analytic Jacobians (A, B) of ``step_semi_implicit`` in tangent coordinates (right perturbations).
+
+    Built by chaining the four sub-updates; each row block is a (3 x 16) map from [d x (12), d F (4)].
+    """
+    R = st.rotation(x)
+    v, w = x[st.V_SL], x[st.W_SL]
+    I, Iinv, M, m = p.inertia, p.inertia_inv, p.mixer, p.mass
+    I3 = np.eye(3)
+    w_new = w + dt * (Iinv @ (M[1:4] @ F - np.cross(w, I @ w)))
+    v_new = step_semi_implicit(x, F, p, dt)[st.V_SL]
+    R_new = R @ so3.Exp(w_new * dt)
+
+    Dw = np.zeros((3, 16))
+    Dw[:, 9:12] = I3 + dt * (-Iinv @ (so3.hat(w) @ I - so3.hat(I @ w)))
+    Dw[:, 12:16] = dt * Iinv @ M[1:4]
+
+    Dv = np.zeros((3, 16))
+    Dv[:, 3:6] = dt * so3.hat(R.T @ np.array([0.0, 0.0, -p.g]))
+    Dv[:, 6:9] = I3 - dt * so3.hat(w_new)
+    Dv[2, 12:16] = dt * M[0] / m
+    Dv += dt * so3.hat(v) @ Dw
+
+    Dth = np.zeros((3, 16))
+    Dth[:, 3:6] = so3.Exp(w_new * dt).T
+    Dth += dt * so3.jacobian_right(w_new * dt) @ Dw
+
+    Dr = np.zeros((3, 16))
+    Dr[:, 0:3] = I3
+    Dr += dt * (-R_new @ so3.hat(v_new) @ Dth + R_new @ Dv)
+
+    J = np.vstack([Dr, Dth, Dv, Dw])
+    return J[:, :12], J[:, 12:]
+
+
+# name -> integrator / matching discrete-time Jacobians (used by simulate, lqr and ilqr)
+INTEGRATORS = {"euler": step_euler, "semi_implicit": step_semi_implicit, "rk4": step_rk4}
+DISCRETIZERS = {"euler": discretize_euler, "semi_implicit": discretize_semi_implicit, "rk4": discretize_zoh, "zoh": discretize_zoh}
 
 
 # ---------------------------------------------------------------------------- helpers

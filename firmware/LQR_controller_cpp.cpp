@@ -447,6 +447,19 @@ static void compute_state_error(const cf_state_t state_cur, const cf_state_t sta
   return;
 }
 
+// rotate the position-error columns (0..2) of a 4x12 gain from yaw = 0 to the target yaw
+static void lqr_rotate_gain_with_yaw(const float K[4][12], float yaw, float Kout[4][12])
+{
+  const float c = cosf(yaw), s = sinf(yaw);
+  for (int i = 0; i < 4; ++i)
+  {
+    for (int j = 0; j < 12; ++j)
+      Kout[i][j] = K[i][j];
+    Kout[i][0] = c * K[i][0] - s * K[i][1];
+    Kout[i][1] = s * K[i][0] + c * K[i][1];
+  }
+}
+
 void hover_control_init()
 {
   // compute the motors angular speeds (in rad/sec) needed, in order for the crazyflie to hover
@@ -545,10 +558,14 @@ void controllerOutOfTree(control_t *control, const setpoint_t *setpoint,
     };
 
     // compute the control vector signal
-    float state_error[3];
+    float state_error[12]; // FIX: was [3]; compute_state_error writes 12 floats (stack overflow)
     compute_state_error(state_cur, state_ref, state_error);
+    // The gain table is designed for yaw = 0 with the position error in the world frame.
+    // For another target yaw, rotate its first three columns: K[:,0:3] <- K[:,0:3] * Rz(yaw)^T
+    float Kyaw[4][12];
+    lqr_rotate_gain_with_yaw(Kinf, radians(setpoint->attitude.yaw), Kyaw);
     float control_feedback[4];
-    mat412_vec12_multiply(Kinf, state_error, control_feedback);
+    mat412_vec12_multiply(Kyaw, state_error, control_feedback);
     for (int i = 0; i < 4; ++i)
     {
       control_speeds[i] = hover_speeds[i] - control_feedback[i];

@@ -50,3 +50,14 @@ def test_speed_gain_conversion_is_consistent_with_linearisation():
     dF = -K_F @ e
     u = p.hover_speed + du
     assert np.allclose(p.Kf * u**2 - p.hover_thrust, dF, rtol=1e-1, atol=1e-6)
+
+
+def test_semi_implicit_design_and_plant_are_consistent():
+    """Gain designed on the semi-implicit model, plant integrated semi-implicitly: stable and converging."""
+    dt = 1e-2
+    K, _ = lq.hover_gain(p, Q, R, dt, discretization="semi_implicit")
+    A, B = dy.discretize_semi_implicit(st.make_state(), p.hover_thrust * np.ones(4), p, dt)
+    assert np.abs(np.linalg.eigvals(A - B @ K)).max() < 1.0
+    x_ref = st.make_state(r=[0.5, 0.5, 0.5])
+    res = sim.simulate(st.make_state(), sim.HoverController(K, x_ref, p), p, 8.0, dt, dt, integrator="semi_implicit")
+    assert np.linalg.norm(st.minus(res.x[-1], x_ref)) < 1e-3

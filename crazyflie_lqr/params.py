@@ -80,3 +80,27 @@ class CrazyflieParams:
     def with_(self, **kw):
         """Copy with some fields replaced (handy for plant/model mismatch studies)."""
         return replace(self, **kw)
+
+
+# ---------------------------------------------------------------- (de)serialisation
+def params_to_dict(p: CrazyflieParams):
+    d = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in p.__dict__.items()}
+    return d
+
+
+def save_params(p: CrazyflieParams, path):
+    import json
+
+    with open(path, "w") as f:
+        json.dump(params_to_dict(p), f, indent=2)
+
+
+def load_params(path) -> CrazyflieParams:
+    """Load parameters saved by :func:`save_params` (missing keys keep their default)."""
+    import json
+
+    with open(path) as f:
+        d = json.load(f)
+    if "inertia" in d:
+        d["inertia"] = np.array(d["inertia"], dtype=float)
+    return CrazyflieParams(**d)

@@ -84,34 +84,46 @@ class SimResult:
 
 
 # ------------------------------------------------------------------------ simulator
-def simulate(x0, policy, plant: CrazyflieParams, T, dt_sim=1e-3, dt_ctrl=4e-3, meas_noise=None, rng=None):
+def simulate(x0, policy, plant: CrazyflieParams, T, dt_sim=1e-3, dt_ctrl=4e-3, meas_noise=None, rng=None,
+             model: CrazyflieParams = None, motor_tau=None, integrator="rk4"):
     """Integrate the plant (RK4) while ``policy`` is called every ``dt_ctrl`` seconds (ZOH).
 
-    ``policy(i, t, x_measured) -> F`` returns the 4 motor thrusts [N]; they are
-    saturated to [0, thrust_max] (equivalently, rotor speeds in [0, speed_max]).
-    ``meas_noise`` = (sigma_pos, sigma_att, sigma_vel, sigma_rate) adds Gaussian
-    noise to the state the controller sees (not to the plant).
+    ``policy(i, t, x_measured) -> F`` returns the 4 *commanded* motor thrusts [N] in the units of the
+    controller's ``model``.  They become rotor-speed commands ``u = sqrt(F / model.Kf)`` (saturated to
+    [0, speed_max]), exactly like the firmware, and the plant produces ``plant.Kf * u**2``.  Hence
+    ``plant`` may differ from ``model`` in mass, inertia, Kf, Kt, arm... (default: model = plant).
+    ``motor_tau`` (s) adds a first-order rotor-speed lag.
+    ``integrator`` selects the plant integrator: "rk4" (default), "semi_implicit" or "euler" (step = ``dt_sim``).
+    ``meas_noise`` = (sigma_pos, sigma_att, sigma_vel, sigma_rate) adds Gaussian noise to the state
+    the controller sees (not to the plant).
     """
+    model = model or plant
+    step = dy.INTEGRATORS[integrator]
     n_steps = int(round(T / dt_sim))
     hold = max(1, int(round(dt_ctrl / dt_sim)))
     rng = rng or np.random.default_rng(0)
     xs = np.zeros((n_steps + 1, 13))
     Fs = np.zeros((n_steps + 1, 4))
+    us = np.zeros((n_steps + 1, 4))
     ts = np.arange(n_steps + 1) * dt_sim
     x = np.array(x0, float)
-    F = plant.hover_thrust * np.ones(4)
+    u_cmd = model.hover_speed * np.ones(4)
+    u = u_cmd.copy()
+    sig = None
+    if meas_noise is not None:
+        sig = np.concatenate([np.full(3, meas_noise[0]), np.full(3, meas_noise[1]),
+                              np.full(3, meas_noise[2]), np.full(3, meas_noise[3])])
     for k in range(n_steps + 1):
         if k % hold == 0:
-            x_meas = x
-            if meas_noise is not None:
-                sig = np.concatenate([np.full(3, meas_noise[0]), np.full(3, meas_noise[1]),
-                                      np.full(3, meas_noise[2]), np.full(3, meas_noise[3])])
-                x_meas = st.plus(x, rng.normal(size=12) * sig)
-            F = np.clip(policy(k // hold, ts[k], x_meas), 0.0, plant.thrust_max)
-        xs[k], Fs[k] = x, F
+            x_meas = x if sig is None else st.plus(x, rng.normal(size=12) * sig)
+            F_cmd = np.clip(policy(k // hold, ts[k], x_meas), 0.0, None)
+            u_cmd = np.clip(np.sqrt(F_cmd / model.Kf), 0.0, plant.speed_max)
+        u = u_cmd if motor_tau is None else u + dt_sim / motor_tau * (u_cmd - u)
+        F = plant.Kf * u**2
+        xs[k], Fs[k], us[k] = x, F, u
         if k < n_steps:
-            x = dy.step_rk4(x, F, plant, dt_sim)
-    return SimResult(ts, xs, Fs, dy.thrusts_to_speeds(Fs, plant), dt_sim, plant)
+            x = step(x, F, plant, dt_sim)
+    return SimResult(ts, xs, Fs, us, dt_sim, plant)
 
 
 # ------------------------------------------------------------------------ metrics
@@ -122,3 +134,61 @@ def tracking_errors(res: SimResult, ref):
     e_att = np.array([np.linalg.norm(st.minus(x, ref.x[i])[3:6]) for x, i in zip(res.x, idx)])
     e_vel = res.x[:, 7:10] - ref.x[idx, 7:10]
     return e_pos, e_att, e_vel, idx
+
+
+class SpeedGainController:
+    """Firmware-style law  u = u_hover - K_u (x (-) x_ref)  in rotor-speed units, saturated to [0, speed_max].
+
+    ``u_hover`` is the feed-forward speed the firmware uses (model hover speed + ``hover_adjust``);
+    ``plant`` provides the thrust coefficient used to convert speeds to thrusts.
+    """
+
+    def __init__(self, K_u, u_hover, x_ref, plant: CrazyflieParams, yaw_rotate=True):
+        from .lqr import rotate_gain_to_yaw
+        from .lie import s3
+
+        self.K = rotate_gain_to_yaw(K_u, s3.yaw_of(x_ref[3:7])) if yaw_rotate else K_u
+        self.u_hover, self.x_ref, self.plant = u_hover, x_ref, plant
+
+    def __call__(self, i, t, x):
+        u = np.clip(self.u_hover - self.K @ st.minus(x, self.x_ref), 0.0, self.plant.speed_max)
+        return self.plant.Kf * u**2
+
+
+# ------------------------------------------------------------- integral controllers
+class _IntegralMixin:
+    """Integrator state with conditional integration (anti-windup) and clamping."""
+
+    def _init_integral(self, dt, axes, xi_max, plant_thrust_max):
+        self.dt, self.axes, self.xi_max, self.Fmax = dt, tuple(axes), xi_max, plant_thrust_max
+        self.xi = np.zeros(len(self.axes))
+
+    def reset(self):
+        self.xi[:] = 0.0
+
+    def _law(self, F_ff, K, e):
+        z = np.concatenate([e, self.xi])
+        F = F_ff - K @ z
+        saturated = np.any(F < 0.0) or np.any(F > self.Fmax)
+        if not saturated:  # conditional integration: freeze the integrator while motors saturate
+            self.xi = np.clip(self.xi + self.dt * e[list(self.axes)], -self.xi_max, self.xi_max)
+        return F
+
+
+class IntegralHoverController(_IntegralMixin):
+    def __init__(self, K_aug, x_ref, p: CrazyflieParams, dt, axes=(0, 1, 2), xi_max=1.0):
+        self.K, self.x_ref, self.F_hover = K_aug, x_ref, p.hover_thrust * np.ones(4)
+        self._init_integral(dt, axes, xi_max, p.thrust_max)
+
+    def __call__(self, i, t, x):
+        return self._law(self.F_hover, self.K, st.minus(x, self.x_ref))
+
+
+class IntegralTVLQRTracker(_IntegralMixin):
+    def __init__(self, ref, K_list, p: CrazyflieParams, axes=(0, 1, 2), xi_max=1.0):
+        self.ref, self.K = ref, K_list
+        self._init_integral(ref.dt, axes, xi_max, p.thrust_max)
+
+    def __call__(self, i, t, x):
+        k = min(i, len(self.ref) - 1)
+        return self._law(self.ref.F[k], self.K[k], st.minus(x, self.ref.x[k]))

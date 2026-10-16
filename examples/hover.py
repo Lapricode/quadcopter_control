@@ -22,6 +22,9 @@ def main():
     ap.add_argument("--target", type=float, nargs=3, default=[1.0, 1.0, 1.0])
     ap.add_argument("--yaw", type=float, default=90.0, help="target yaw [deg]")
     ap.add_argument("--T", type=float, default=8.0)
+    ap.add_argument("--integral", type=float, nargs="?", const=0.3, default=None, metavar="TOL",
+                    help="add integral action (TOL in m s, default 0.3)")
+    ap.add_argument("--mass-error", type=float, default=0.0, help="plant mass = (1+e) * model mass")
     ap.add_argument("--animate", action="store_true")
     ap.add_argument("--export", action="store_true", help="write results/Kinf_speeds.txt for the firmware")
     a = ap.parse_args()
@@ -32,7 +35,13 @@ def main():
     yaw = np.radians(a.yaw)
     K, _ = lq.hover_gain(p, Q, R, dt, yaw=yaw)  # exact for any yaw, no look-up table
     x_ref = st.make_state(r=a.target, yaw=yaw)
-    res = sim.simulate(st.make_state(), sim.HoverController(K, x_ref, p), p, a.T, 1e-3, dt)
+    plant = p.with_(mass=p.mass * (1 + a.mass_error))
+    if a.integral is None:
+        policy = sim.HoverController(K, x_ref, p)
+    else:
+        K_i = lq.hover_gain_integral(p, Q, R, dt, yaw=yaw, int_tol=a.integral)
+        policy = sim.IntegralHoverController(K_i, x_ref, p, dt)
+    res = sim.simulate(st.make_state(), policy, plant, a.T, 1e-3, dt)
     print("final error:", np.round(st.minus(res.x[-1], x_ref), 6))
     print("saturated fraction: %.3f" % (res.F >= p.thrust_max - 1e-9).mean())
     res.save_npz(OUT / "hover.npz")

@@ -34,6 +34,7 @@ def dare_gain(A, B, Q, R):
 
 
 def hover_gain(p: CrazyflieParams, Q, R, dt, yaw=0.0, discretization="zoh"):
+    # discretization: "zoh" (exact, default), "semi_implicit" or "euler" -> match the integrator of the plant
     """Infinite-horizon hover gain for a given yaw, so that  dF = -K (x (-) x_ref).
 
     The hover error dynamics are invariant to yaw *once the position error is
@@ -44,7 +45,7 @@ def hover_gain(p: CrazyflieParams, Q, R, dt, yaw=0.0, discretization="zoh"):
     """
     x0 = st.make_state(yaw=0.0)
     F0 = p.hover_thrust * np.ones(4)
-    disc = dy.discretize_zoh if discretization == "zoh" else dy.discretize_euler
+    disc = dy.DISCRETIZERS[discretization]
     A, B = disc(x0, F0, p, dt)
     K0, P0 = dare_gain(A, B, Q, R)
     return rotate_gain_to_yaw(K0, yaw), P0
@@ -97,7 +98,7 @@ def tvlqr_along_reference(ref, p: CrazyflieParams, Q, R, Qf=None, discretization
     the last one is repeated so that the controller can run for len(ref) steps.
     If ``Qf`` is None the terminal cost is the DARE solution of the last point.
     """
-    disc = dy.discretize_zoh if discretization == "zoh" else dy.discretize_euler
+    disc = dy.DISCRETIZERS[discretization]
     n = len(ref.t)
     A_list, B_list = [], []
     for k in range(n - 1):
@@ -107,5 +108,69 @@ def tvlqr_along_reference(ref, p: CrazyflieParams, Q, R, Qf=None, discretization
     if Qf is None:
         _, Qf = dare_gain(A_list[-1], B_list[-1], Q, R)
     K_list, _ = tvlqr(A_list, B_list, Q, R, Qf)
+    K_list.append(K_list[-1])
+    return K_list
+
+
+# ============================================================ integral action
+def augment_integral(A, B, dt, axes=(0, 1, 2)):
+    """Append integrators  xi+ = xi + dt * e_pos[axes]  (world-frame position error) to (A, B)."""
+    n, m = B.shape
+    k = len(axes)
+    Aa = np.zeros((n + k, n + k))
+    Aa[:n, :n] = A
+    Aa[n:, n:] = np.eye(k)
+    for i, ax in enumerate(axes):
+        Aa[n + i, ax] = dt
+    Ba = np.vstack([B, np.zeros((k, m))])
+    return Aa, Ba
+
+
+def integral_weight(tol):
+    """Weight for the integral states: tol is an acceptable |integral of position error| [m s]."""
+    return tol**-2
+
+
+def hover_gain_integral(p: CrazyflieParams, Q, R, dt, yaw=0.0, int_tol=0.1, axes=(0, 1, 2), discretization="zoh"):
+    """Hover gain with integral action, shape (4, 12 + len(axes)).
+
+    Yaw-invariance still holds when the integral of the *world-frame* position error is rotated
+    together with the error, so one Riccati solve at yaw = 0 is enough here too (needs axes = (0,1,2)
+    or any set closed under rotation about z; for ``axes=(2,)`` only the z column is used).
+    """
+    x0 = st.make_state()
+    F0 = p.hover_thrust * np.ones(4)
+    A, B = dy.DISCRETIZERS[discretization](x0, F0, p, dt)
+    Aa, Ba = augment_integral(A, B, dt, axes)
+    Qa = np.zeros((Aa.shape[0],) * 2)
+    Qa[:12, :12] = Q
+    Qa[12:, 12:] = integral_weight(int_tol) * np.eye(len(axes))
+    K0, _ = dare_gain(Aa, Ba, Qa, R)
+    K = K0.copy()
+    T = np.eye(12)
+    T[0:3, 0:3] = so3.rot_z(yaw).T
+    K[:, :12] = K0[:, :12] @ T
+    if len(axes) == 3:
+        K[:, 12:15] = K0[:, 12:15] @ so3.rot_z(yaw).T
+    elif yaw != 0.0 and axes != (2,):
+        raise ValueError("yaw rotation of the integral columns needs axes=(0,1,2) or (2,)")
+    return K
+
+
+def tvlqr_along_reference_integral(ref, p: CrazyflieParams, Q, R, int_tol=0.1, axes=(0, 1, 2), Qf=None, discretization="zoh"):
+    """TVLQR on the integral-augmented error system (gains of shape (4, 12 + len(axes)))."""
+    n = len(ref.t)
+    Qa = np.zeros((12 + len(axes),) * 2)
+    Qa[:12, :12] = Q
+    Qa[12:, 12:] = integral_weight(int_tol) * np.eye(len(axes))
+    A_list, B_list = [], []
+    for k in range(n - 1):
+        A, B = dy.DISCRETIZERS[discretization](ref.x[k], ref.F[k], p, ref.dt)
+        Aa, Ba = augment_integral(A, B, ref.dt, axes)
+        A_list.append(Aa)
+        B_list.append(Ba)
+    if Qf is None:
+        _, Qf = dare_gain(A_list[-1], B_list[-1], Qa, R)
+    K_list, _ = tvlqr(A_list, B_list, Qa, R, Qf)
     K_list.append(K_list[-1])
     return K_list

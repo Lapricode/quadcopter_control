@@ -46,6 +46,8 @@ def main(argv=None):
     ap.add_argument("--offset", type=float, nargs=3, default=[0.15, -0.10, 0.10], help="initial position error [m]")
     ap.add_argument("--mass-error", type=float, default=0.0, help="plant mass = (1+e) * model mass")
     ap.add_argument("--noise", action="store_true", help="noisy state measurements")
+    ap.add_argument("--integral", type=float, nargs="?", const=0.05, default=None, metavar="TOL",
+                    help="add integral action; TOL = acceptable |integral of pos. error| [m s] (default 0.05)")
     ap.add_argument("--dt-ctrl", type=float, default=4e-3)
     ap.add_argument("--animate", action="store_true")
     ap.add_argument("--gif", type=str, default=None)
@@ -58,11 +60,15 @@ def main(argv=None):
         Q, R = lq.bryson_weights(pos=1.0, att=0.2, vel=0.1, rate=4.0, thrust=0.05)
     else:
         Q, R = lq.bryson_weights(pos=0.1, att=0.2, vel=0.5, rate=4.0, thrust=0.05)
-    K = lq.tvlqr_along_reference(ref, model, Q, R)
+    if a.integral is None:
+        policy = sim.TVLQRTracker(ref, lq.tvlqr_along_reference(ref, model, Q, R))
+    else:
+        K = lq.tvlqr_along_reference_integral(ref, model, Q, R, int_tol=a.integral)
+        policy = sim.IntegralTVLQRTracker(ref, K, model)
     x0 = ref.x[0].copy()
     x0[:3] += a.offset
     noise = (0.002, 0.005, 0.01, 0.05) if a.noise else None
-    res = sim.simulate(x0, sim.TVLQRTracker(ref, K), plant, ref.t[-1], 1e-3, a.dt_ctrl, meas_noise=noise)
+    res = sim.simulate(x0, policy, plant, ref.t[-1], 1e-3, a.dt_ctrl, meas_noise=noise)
 
     e_pos, e_att, e_vel, _ = sim.tracking_errors(res, ref)
     half = len(res.t) // 4  # skip the initial transient caused by the offset
@@ -70,7 +76,7 @@ def main(argv=None):
           f"max {1000*np.linalg.norm(e_pos[half:], axis=1).max():.2f} mm, "
           f"vel RMS {np.sqrt((e_vel[half:]**2).sum(1).mean()):.4f} m/s, att RMS {np.degrees(np.sqrt((e_att[half:]**2).mean())):.3f} deg")
     print("saturated fraction: %.4f" % (res.F >= model.thrust_max - 1e-9).mean())
-    tag = a.traj + ("_velprio" if a.vel_priority else "")
+    tag = a.traj + ("_velprio" if a.vel_priority else "") + ("_int" if a.integral is not None else "")
     res.save_npz(OUT / f"{tag}.npz")
     from crazyflie_lqr.visualize import plot_summary, quadrotor_visualize
 

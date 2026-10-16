@@ -191,3 +191,9 @@ def velocity_profile_trajectory(
     pos = np.asarray(r0, float) + cumulative_simpson(vel, dx=dt, axis=0, initial=0.0)
     yaw_arr = np.full_like(t, yaw) if np.isscalar(yaw) else yaw(t)
     return flat_reference(t - t[0], pos, vel, acc, yaw_arr, p, name=name)
+
+
+def subsample(ref: Reference, n: int) -> Reference:
+    """Keep every n-th sample (e.g. plan at 20 ms from a reference computed at 4 ms)."""
+    return Reference(t=ref.t[::n], x=ref.x[::n], F=ref.F[::n], pos=ref.pos[::n], vel=ref.vel[::n],
+                     acc=ref.acc[::n], yaw=ref.yaw[::n], name=ref.name)
